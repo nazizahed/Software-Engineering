@@ -1,179 +1,132 @@
-# manage_data.py
+"""Import Dati Lombardia station and measurement CSV files into PostGIS."""
+
+import argparse
+from pathlib import Path
 
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
-# -----------------------------
-# Step 1: Load Sensor Metadata
-# -----------------------------
-sensors_df = pd.read_csv("Database\data\Stazioni_qualit__dell_aria_20250507.csv", sep=",")
+from config import database_connection_kwargs
+from data_prep import prepare_measurements, prepare_sensors
 
-sensors_clean = sensors_df[[
-    'IdSensore', 'NomeStazione', 'Provincia', 'lat', 'lng'
-]].copy()
 
-sensors_clean.rename(columns={
-    'IdSensore': 'sensor_id',
-    'NomeStazione': 'station_name',
-    'Provincia': 'province',
-    'lat': 'latitude',
-    'lng': 'longitude'
-}, inplace=True)
+def import_data(sensors: pd.DataFrame, measurements: pd.DataFrame) -> None:
+    sensor_rows = [
+        (
+            row.sensor_id,
+            row.station_name,
+            row.province,
+            float(row.latitude),
+            float(row.longitude),
+            float(row.longitude),
+            float(row.latitude),
+        )
+        for row in sensors.itertuples(index=False)
+    ]
+    raw_rows = [
+        (row.sensor_id, row.timestamp, row.pollutant, float(row.value))
+        for row in measurements.itertuples(index=False)
+    ]
 
-sensors_clean.dropna(subset=['latitude', 'longitude'], inplace=True)
-
-# -----------------------------
-# Step 2: Connect to Database
-# -----------------------------
-try:
-    mydb = psycopg2.connect(
-        host='localhost',
-        database='SE',
-        user='SE',
-        password='191919'
+    daily = (
+        measurements.assign(date=measurements["timestamp"].dt.date)
+        .groupby(["sensor_id", "pollutant", "date"])["value"]
+        .agg(daily_avg="mean", daily_min="min", daily_max="max")
+        .reset_index()
     )
-    print("📡 Connected to database.")
-except Exception as e:
-    print("❌ Connection failed:", e)
-    exit()
-
-cur = mydb.cursor()
-
-# Insert sensor metadata
-for _, row in sensors_clean.iterrows():
-    cur.execute("""
-        INSERT INTO sensors (sensor_id, station_name, province, latitude, longitude, geom)
-        VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-        ON CONFLICT (sensor_id) DO NOTHING;
-    """, (
-        str(row['sensor_id']),
-        row['station_name'],
-        row['province'],
-        row['latitude'],
-        row['longitude'],
-        row['longitude'],  # X
-        row['latitude']    # Y
-    ))
-
-mydb.commit()
-
-# -----------------------------
-# Step 3: Load & Clean Measurements
-# -----------------------------
-measurements_df = pd.read_csv("Database\data\Dati_sensori_aria_dal_2018_20250507.csv", sep=",")
-
-measurements_df.columns = measurements_df.columns.str.strip()
-measurements_df['timestamp'] = pd.to_datetime(measurements_df['Data'], format='%d/%m/%Y %H:%M:%S')
-measurements_df.dropna(subset=['idSensore', 'Valore'], inplace=True)
-
-# Keep only data before 2024
-measurements_df = measurements_df[measurements_df['timestamp'].dt.year < 2024]
-
-measurements_df.rename(columns={
-    'idSensore': 'sensor_id',
-    'Valore': 'value'
-}, inplace=True)
-
-sensor_pollutants = sensors_df[['IdSensore', 'NomeTipoSensore']].copy()
-sensor_pollutants.rename(columns={
-    'IdSensore': 'sensor_id',
-    'NomeTipoSensore': 'pollutant'
-}, inplace=True)
-
-measurements_merged = measurements_df.merge(sensor_pollutants, on='sensor_id', how='left')
-measurements_merged.dropna(subset=['pollutant'], inplace=True)
-# Filter out invalid values BEFORE storing in raw_measurements
-measurements_merged = measurements_merged[
-    (measurements_merged["value"] >= 0) & (measurements_merged["value"] != -9999)
-]
-
-
-# -----------------------------
-# Step 4: Insert Raw Measurements
-# -----------------------------
-print("💾 Inserting raw measurements...")
-cur.execute("DELETE FROM raw_measurements;")
-raw_rows = [
-    (
-        str(row['sensor_id']),
-        row['timestamp'],
-        row['pollutant'],
-        float(row['value'])
+    daily_rows = [
+        (
+            row.sensor_id,
+            row.date,
+            row.pollutant,
+            round(float(row.daily_avg), 3),
+            round(float(row.daily_min), 3),
+            round(float(row.daily_max), 3),
+        )
+        for row in daily.itertuples(index=False)
+    ]
+    pollutant_rows = list(
+        measurements[["sensor_id", "pollutant"]]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
     )
-    for _, row in measurements_merged.iterrows()
-]
 
-execute_values(
-    cur,
-    """
-    INSERT INTO raw_measurements (sensor_id, timestamp, pollutant, value)
-    VALUES %s
-    """,
-    raw_rows,
-    page_size=10000
-)
-
-# -----------------------------
-# Step 5: Aggregate Daily Data
-# -----------------------------
-print("📆 Aggregating daily data...")
-measurements_merged['date'] = measurements_merged['timestamp'].dt.date
-
-daily_stats = measurements_merged.groupby(
-    ['sensor_id', 'pollutant', 'date']
-)['value'].agg(
-    daily_avg='mean',
-    daily_min='min',
-    daily_max='max'
-).reset_index()
-
-daily_stats.rename(columns={'date': 'timestamp'}, inplace=True)
-
-cur.execute("DELETE FROM measurements;")
-daily_rows = [
-    (
-        str(row['sensor_id']),
-        row['timestamp'],
-        row['pollutant'],
-        round(row['daily_avg'], 3),
-        round(row['daily_min'], 3),
-        round(row['daily_max'], 3)
+    with psycopg2.connect(**database_connection_kwargs()) as connection:
+        with connection.cursor() as cursor:
+            execute_values(
+                cursor,
+                """
+                INSERT INTO sensors
+                    (sensor_id, station_name, province, latitude, longitude, geom)
+                VALUES %s
+                ON CONFLICT (sensor_id) DO UPDATE SET
+                    station_name = EXCLUDED.station_name,
+                    province = EXCLUDED.province,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    geom = EXCLUDED.geom;
+                """,
+                sensor_rows,
+                template="(%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))",
+                page_size=5000,
+            )
+            cursor.execute("DELETE FROM sensor_pollutants;")
+            cursor.execute("DELETE FROM measurements;")
+            cursor.execute("DELETE FROM raw_measurements;")
+            execute_values(
+                cursor,
+                """
+                INSERT INTO raw_measurements (sensor_id, timestamp, pollutant, value)
+                VALUES %s;
+                """,
+                raw_rows,
+                page_size=10000,
+            )
+            execute_values(
+                cursor,
+                """
+                INSERT INTO measurements
+                    (sensor_id, timestamp, pollutant, daily_avg, daily_min, daily_max)
+                VALUES %s;
+                """,
+                daily_rows,
+                page_size=10000,
+            )
+            execute_values(
+                cursor,
+                """
+                INSERT INTO sensor_pollutants (sensor_id, pollutant)
+                VALUES %s ON CONFLICT DO NOTHING;
+                """,
+                pollutant_rows,
+                page_size=5000,
+            )
+    print(
+        f"Imported {len(sensors):,} sensors, {len(raw_rows):,} hourly records, "
+        f"and {len(daily_rows):,} daily aggregates."
     )
-    for _, row in daily_stats.iterrows()
-]
 
-execute_values(
-    cur,
-    """
-    INSERT INTO measurements (sensor_id, timestamp, pollutant, daily_avg, daily_min, daily_max)
-    VALUES %s
-    """,
-    daily_rows,
-    page_size=10000
-)
 
-# -----------------------------
-# Step 6: Fill sensor_pollutants table
-# -----------------------------
-print("🧭 Mapping sensors to pollutants...")
-cur.execute("DELETE FROM sensor_pollutants;")
-sensor_pollutant_pairs = measurements_merged[['sensor_id', 'pollutant']].drop_duplicates()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sensors-csv", required=True, type=Path)
+    parser.add_argument("--measurements-csv", required=True, type=Path)
+    parser.add_argument(
+        "--before-year",
+        type=int,
+        default=2024,
+        help="Keep records before this year, matching the original project scope. Use 0 for all years.",
+    )
+    return parser.parse_args()
 
-execute_values(
-    cur,
-    """
-    INSERT INTO sensor_pollutants (sensor_id, pollutant)
-    VALUES %s
-    ON CONFLICT DO NOTHING;
-    """,
-    list(sensor_pollutant_pairs.itertuples(index=False, name=None))
-)
 
-# -----------------------------
-# Finalize
-# -----------------------------
-mydb.commit()
-cur.close()
-mydb.close()
-print("✅ All data inserted successfully.")
+if __name__ == "__main__":
+    arguments = parse_args()
+    sensor_frame, sensor_pollutant_frame = prepare_sensors(arguments.sensors_csv)
+    measurement_frame = prepare_measurements(
+        arguments.measurements_csv,
+        sensor_pollutant_frame,
+        before_year=arguments.before_year or None,
+    )
+    import_data(sensor_frame, measurement_frame)
