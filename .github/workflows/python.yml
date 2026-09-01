@@ -1,0 +1,24 @@
+name: Python checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python source
+        run: python -m compileall -q app.py config.py create_table.py dash_app.py data_prep.py manage_data.py tests
+      - name: Run data-preparation tests
+        run: python -m unittest discover -s tests -v
